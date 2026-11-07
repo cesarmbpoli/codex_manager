@@ -4,6 +4,10 @@ Gerenciador local de múltiplas contas para o Codex CLI, com isolamento de auten
 sessões compartilhadas, seleção por quota, failover automático de `codex exec` e retomada
 agendada via `systemd --user`.
 
+## Manual
+
+Para instalação, operação diária, failover, jobs agendados, diagnóstico e troubleshooting, consulte o [Manual do Codex Account Manager](docs/MANUAL.md).
+
 ## O que muda na v1.3
 
 ### Thread/session determinística
