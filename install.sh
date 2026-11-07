@@ -32,7 +32,7 @@ PY
 fi
 
 # Preserve the v1.1 real runtime target before replacing codex_real with the
-# stable v1.2 launcher.
+# stable v1.3 launcher.
 LEGACY_HINT=""
 if [[ -n "$OLD_REAL" && -x "$OLD_REAL" ]] && ! is_manager_wrapper "$OLD_REAL"; then
   LEGACY_HINT="$OLD_REAL"
@@ -67,6 +67,10 @@ defaults = {
     "codex_real": runtime,
     "codex_runtime_hints": [],
     "runtime_check_ttl_seconds": 300,
+    "prerelease_policy": "stable",
+    "usage_probe_ttl_seconds": 120,
+    "account_scoring": True,
+    "pending_retention_days": 30,
     "manager_bin": manager,
     "default_cooldown_minutes": 30,
     "no_daemon": True,
@@ -126,7 +130,7 @@ PY
 rm -f "$ROOT/runtime-cache.json"
 systemctl --user daemon-reload || true
 
-echo "Codex Account Manager v1.2 installed/upgraded."
+echo "Codex Account Manager v1.3 installed/upgraded."
 echo
 echo "  manager: $BIN_DIR/codex-account"
 echo "  wrapper: $WRAPPER_DIR/codex"

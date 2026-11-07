@@ -1,177 +1,279 @@
-# Codex Account Manager - v1.2
+# Codex Account Manager - v1.3
 
-Local multi-account manager for the Codex CLI.
+Gerenciador local de múltiplas contas para o Codex CLI, com isolamento de autenticação,
+sessões compartilhadas, seleção por quota, failover automático de `codex exec` e retomada
+agendada via `systemd --user`.
 
-It keeps account authentication isolated while sharing Codex sessions/configuration,
-supports automatic account failover for `codex exec`, and can schedule session resume
-with `systemd --user` when every account is temporarily rate-limited.
+## O que muda na v1.3
 
-## v1.2: transparent Codex runtime updates
+### Thread/session determinística
 
-v1.1 installed the manager wrapper directly at:
+O manager não procura mais a sessão pelo arquivo `rollout-*.jsonl` mais recente.
 
-```text
-~/.local/bin/codex
+Para execuções gerenciadas, ele ativa internamente `codex exec --json` e captura o evento:
+
+```json
+{"type":"thread.started","thread_id":"..."}
 ```
 
-That collides with the default visible command used by the official Codex standalone
-installer.
+Esse `thread_id` é o identificador usado no `codex exec resume`. Isso torna o failover
+seguro mesmo com múltiplos `codex exec` concorrentes.
 
-v1.2 separates the two responsibilities:
+Se o usuário já pediu `--json`, o JSONL é preservado na saída. Caso contrário, o manager
+renderiza as mensagens do agente como saída normal.
 
-```text
-~/.local/lib/codex-manager/bin/codex   manager wrapper
-~/.local/lib/codex-manager/codex-runtime  runtime launcher
-~/.local/bin/codex                     free for official Codex
-```
+### Quota antes da criação da thread
 
-The manager's `codex_real` now points to the stable `codex-runtime` launcher rather
-than to one specific Codex release.
+`thread.started` é o primeiro evento estruturado de uma execução. Portanto, se uma conta
+atingir quota antes desse evento, não há thread persistida para retomar.
 
-The runtime launcher discovers the actual official Codex automatically from:
+Nesse caso a v1.3 reexecuta o pedido original na próxima conta. Se todas as contas estiverem
+limitadas, o job agendado guarda:
 
-- the legacy v1.1 runtime target, preserved as a hint;
-- `~/.local/bin/codex`;
-- the default standalone installation under `~/.codex/packages/standalone`;
-- standalone installations under managed account `CODEX_HOME` directories;
-- other Codex installations visible on `PATH` (npm, bun, system installs).
+- diretório de trabalho;
+- argumentos originais de `codex exec`;
+- modo `fresh`;
+- horário do próximo reset.
 
-When multiple runtimes are found, it probes their versions and selects the newest
-detectable version. Discovery is cached for 300 seconds by default.
+Quando existir `thread_id`, o job muda para modo `resume`.
 
-This means an official Codex update can replace its own binary/symlink without
-overwriting the manager wrapper.
+### Reset de quota
 
-## Install / upgrade
+O parser reconhece:
 
-From the cloned repository:
+- timestamp ISO;
+- `try again in N minutes/hours`;
+- `try again at 7:58 PM`.
+
+Além disso, a seleção de conta usa a interface estruturada do app-server
+`account/rateLimits/read` quando disponível.
+
+### Scoring por quota
+
+Por padrão, antes de uma execução o manager atualiza snapshots de quota que estejam mais
+velhos que 120 segundos.
+
+O score favorece a conta com maior headroom no bucket mais restritivo. A preferência manual
+continua como desempate, em vez de forçar uma conta quase esgotada.
+
+Veja os dados:
 
 ```bash
+codex-account usage
+```
+
+A coluna `HEADROOM` é o menor percentual restante entre as janelas conhecidas.
+
+### Runtime stable
+
+O launcher continua descobrindo automaticamente o Codex oficial, mas a política padrão agora é:
+
+```json
+"prerelease_policy": "stable"
+```
+
+Uma instalação `0.169.0-alpha.2` não passa silenciosamente à frente de uma stable
+`0.167.0`.
+
+Para permitir prerelease explicitamente:
+
+```json
+"prerelease_policy": "allow-prerelease"
+```
+
+### Runtime cache concorrente
+
+`runtime-cache.json` agora usa:
+
+- `flock`;
+- arquivo temporário único;
+- `os.replace()`.
+
+Duas instâncias simultâneas do Codex não disputam mais o mesmo
+`runtime-cache.json.tmp`.
+
+### Contrato de compatibilidade
+
+`codex-account doctor` valida no runtime instalado:
+
+- `codex --version`;
+- `codex exec --help`;
+- suporte a `--json`;
+- suporte a `resume`;
+- `codex app-server --help`;
+- login de cada conta.
+
+Uma mudança incompatível no CLI deixa de aparecer apenas durante uma tarefa real.
+
+### systemd
+
+Valores inseridos em unit files escapam também `%`, evitando expansão involuntária de
+specifiers do systemd.
+
+O serviço de retomada não apaga mais o próprio unit file enquanto está executando.
+Ao concluir, apenas desativa o timer. A remoção física é feita pelo garbage collector.
+
+### Pending jobs
+
+Por padrão:
+
+```bash
+codex-account pending
+```
+
+mostra apenas jobs ativos.
+
+Histórico completo:
+
+```bash
+codex-account pending --all
+```
+
+Limpeza:
+
+```bash
+codex-account gc
+```
+
+O default é remover registros terminais com mais de 30 dias. Pode ser alterado:
+
+```bash
+codex-account gc --days 7
+```
+
+## Instalação / upgrade
+
+```bash
+cd ~/code/codex_manager
 git pull origin main
 ./install.sh
 source ~/.bashrc
 ```
 
-Then validate:
+Valide:
 
 ```bash
 which codex
-~/.local/lib/codex-manager/codex-runtime --manager-runtime-info
+codex --version
 codex-account doctor
-codex-account list
+codex-account usage
 ```
 
-Expected `which codex`:
+O wrapper esperado:
 
 ```text
 ~/.local/lib/codex-manager/bin/codex
 ```
 
-The official Codex can still live at `~/.local/bin/codex`; our wrapper wins because
-its dedicated directory is prepended to `PATH`.
+O Codex oficial continua livre para usar:
 
-## Force runtime rediscovery
-
-Normally rediscovery happens automatically after the cache TTL.
-
-To force it immediately:
-
-```bash
-~/.local/lib/codex-manager/codex-runtime --manager-runtime-refresh
+```text
+~/.local/bin/codex
 ```
 
-To inspect without changing normal CLI behavior:
+## Uso normal
 
-```bash
-~/.local/lib/codex-manager/codex-runtime --manager-runtime-info
-```
-
-Example:
-
-```json
-{
-  "method": "standalone",
-  "path": "/home/user/.local/bin/codex",
-  "version": "codex-cli 0.x.y"
-}
-```
-
-## Accounts
-
-Import the current Codex account:
-
-```bash
-codex-account bootstrap principal
-```
-
-Add more accounts:
-
-```bash
-codex-account add secundaria
-codex-account add terceira
-```
-
-List:
-
-```bash
-codex-account list
-```
-
-Choose a preferred account:
-
-```bash
-codex-account use secundaria
-```
-
-## Normal use
-
-Interactive:
+TUI:
 
 ```bash
 codex
 ```
 
-Non-interactive with automatic failover:
+Execução com failover:
 
 ```bash
-codex exec "implement the next milestone"
+codex exec "implemente a próxima milestone"
 ```
 
-If one account reaches its usage limit, the manager marks it unavailable and resumes
-the same Codex session with another account.
+JSONL explícito:
 
-## All accounts limited
+```bash
+codex exec --json "analise o projeto"
+```
 
-For `codex exec`, if all accounts are unavailable, the manager records the session and
-creates a persistent `systemd --user` timer for the earliest known reset.
+## Contas
 
-Inspect pending resumes:
+```bash
+codex-account list
+codex-account usage
+codex-account use principal
+codex-account next
+codex-account login secundaria
+```
+
+Adicionar:
+
+```bash
+codex-account add terceira
+```
+
+## Jobs agendados
 
 ```bash
 codex-account pending
 systemctl --user list-timers 'codex-resume-*'
 ```
 
-Cancel:
+Cancelar por JOB:
 
 ```bash
-codex-account cancel <SESSION_ID>
+codex-account cancel <JOB_ID>
 ```
 
-Force resume now:
+Retomar manualmente:
+
+```bash
+codex-account resume-job <JOB_ID>
+```
+
+O comando antigo continua aceito para compatibilidade:
 
 ```bash
 codex-account resume-session <SESSION_ID>
 ```
 
-## Layout
+## Runtime
+
+Inspecionar:
+
+```bash
+~/.local/lib/codex-manager/codex-runtime --manager-runtime-info
+```
+
+Forçar redescoberta:
+
+```bash
+~/.local/lib/codex-manager/codex-runtime --manager-runtime-refresh
+```
+
+## Configuração
+
+Arquivo:
+
+```text
+~/.codex-manager/manager.json
+```
+
+Campos principais da v1.3:
+
+```json
+{
+  "prerelease_policy": "stable",
+  "runtime_check_ttl_seconds": 300,
+  "usage_probe_ttl_seconds": 120,
+  "account_scoring": true,
+  "auto_schedule": true,
+  "schedule_grace_seconds": 20,
+  "default_cooldown_minutes": 30,
+  "pending_retention_days": 30
+}
+```
+
+## Estrutura
 
 ```text
 ~/.codex-manager/
-|-- accounts/
-|   |-- principal/home/
-|   |-- secundaria/home/
-|   `-- ...
+|-- accounts/<conta>/home/
 |-- shared/
 |   |-- config.toml
 |   |-- sessions/
@@ -182,6 +284,7 @@ codex-account resume-session <SESSION_ID>
 |-- pending/
 |-- manager.json
 |-- runtime-cache.json
+|-- .runtime.lock
 `-- state.json
 
 ~/.local/lib/codex-manager/
@@ -189,54 +292,21 @@ codex-account resume-session <SESSION_ID>
 `-- codex-runtime
 ```
 
-## Diagnostics
+## Testes
+
+A CI executa em Python 3.11, 3.12 e 3.13:
+
+- `py_compile` dos scripts Python;
+- `bash -n` dos scripts shell;
+- testes unitários de parsing de reset;
+- escaping do systemd;
+- scoring por quota;
+- parsing stable/prerelease do runtime.
+
+Localmente:
 
 ```bash
-codex-account doctor
-codex-account list
-~/.local/lib/codex-manager/codex-runtime --manager-runtime-info
+python3 -m py_compile codex-account codex-runtime
+bash -n codex-wrapper install.sh
+python3 -m unittest discover -s tests -v
 ```
-
-For runtime selection debug on a normal invocation:
-
-```bash
-CODEX_MANAGER_RUNTIME_DEBUG=1 codex --version
-```
-
-## Configuration
-
-`~/.codex-manager/manager.json`
-
-Relevant v1.2 fields:
-
-```json
-{
-  "codex_real": "/home/user/.local/lib/codex-manager/codex-runtime",
-  "codex_runtime_hints": [],
-  "runtime_check_ttl_seconds": 300,
-  "auto_schedule": true,
-  "schedule_grace_seconds": 20,
-  "default_cooldown_minutes": 30
-}
-```
-
-## Rollback
-
-The original `~/.codex` account data is not removed by the manager.
-
-Remove the v1.2 wrapper:
-
-```bash
-rm ~/.local/lib/codex-manager/bin/codex
-```
-
-Then remove the PATH block between:
-
-```text
-# >>> codex-manager >>>
-# <<< codex-manager <<<
-```
-
-from `~/.bashrc`.
-
-The official `~/.local/bin/codex` remains untouched.

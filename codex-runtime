@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import os
+import fcntl
+import tempfile
 from pathlib import Path
 import re
 import subprocess
@@ -12,6 +14,7 @@ import time
 ROOT = Path(os.environ.get("CODEX_ACCOUNT_MANAGER_HOME", Path.home() / ".codex-manager"))
 CFG = ROOT / "manager.json"
 CACHE = ROOT / "runtime-cache.json"
+LOCK = ROOT / ".runtime.lock"
 WRAPPER = Path.home() / ".local/lib/codex-manager/bin/codex"
 SELF = Path(__file__)
 DEFAULT_TTL = 300
@@ -24,11 +27,29 @@ def load_json(path: Path) -> dict:
         return {}
 
 
+class RuntimeLock:
+    def __enter__(self):
+        ROOT.mkdir(parents=True, exist_ok=True)
+        self.f = LOCK.open("a+")
+        fcntl.flock(self.f.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *_):
+        fcntl.flock(self.f.fileno(), fcntl.LOCK_UN)
+        self.f.close()
+
+
 def save_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def is_manager_wrapper(path: Path) -> bool:
@@ -108,7 +129,15 @@ def candidates() -> list[Path]:
     return out
 
 
-def version(path: Path) -> tuple[tuple[int, int, int], str | None]:
+def parse_version(text: str) -> tuple[tuple[int, int, int], bool]:
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)([-+][0-9A-Za-z.-]+)?", text)
+    if not m:
+        return (0, 0, 0), False
+    prerelease = bool(m.group(4) and m.group(4).startswith("-"))
+    return tuple(int(x) for x in m.group(1, 2, 3)), prerelease
+
+
+def version(path: Path) -> tuple[tuple[int, int, int], str | None, bool]:
     try:
         p = subprocess.run(
             [str(path), "--version"],
@@ -118,17 +147,14 @@ def version(path: Path) -> tuple[tuple[int, int, int], str | None]:
             timeout=8,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return (0, 0, 0), None
+        return (0, 0, 0), None, False
 
     if p.returncode != 0:
-        return (0, 0, 0), None
+        return (0, 0, 0), None, False
 
     text = p.stdout.strip()
-    m = re.search(r"(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?", text)
-    if not m:
-        return (0, 0, 0), text or None
-
-    return tuple(int(x) for x in m.groups()), text
+    key, prerelease = parse_version(text)
+    return key, text or None, prerelease
 
 
 def method(path: Path) -> str:
@@ -165,35 +191,50 @@ def cache_valid(cache: dict, ttl: int) -> bool:
 def discover(force: bool = False) -> dict:
     cfg = load_json(CFG)
     ttl = int(cfg.get("runtime_check_ttl_seconds", DEFAULT_TTL) or DEFAULT_TTL)
-    cache = load_json(CACHE)
+    policy = str(cfg.get("prerelease_policy", "stable")).lower()
 
-    if not force and cache_valid(cache, ttl):
-        return cache
+    with RuntimeLock():
+        cache = load_json(CACHE)
+        if not force and cache_valid(cache, ttl):
+            if policy != "stable" or not cache.get("prerelease", False):
+                return cache
 
-    found = candidates()
-    if not found:
-        raise SystemExit(
-            "Codex official runtime not found. Install/update Codex, then run "
-            "'codex-runtime --manager-runtime-info'."
-        )
+        found = candidates()
+        if not found:
+            raise SystemExit(
+                "Codex official runtime not found. Install/update Codex, then run "
+                "'codex-runtime --manager-runtime-info'."
+            )
 
-    ranked = []
-    for idx, p in enumerate(found):
-        key, text = version(p)
-        ranked.append((key, -idx, p, text))
+        ranked = []
+        for idx, p in enumerate(found):
+            key, text, prerelease = version(p)
+            ranked.append((key, -idx, p, text, prerelease))
 
-    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    key, _, chosen, text = ranked[0]
+        if policy == "stable":
+            stable = [item for item in ranked if not item[4]]
+            if stable:
+                ranked = stable
+            else:
+                raise SystemExit(
+                    "Only prerelease Codex runtimes were found while prerelease_policy=stable. "
+                    "Install a stable Codex or set prerelease_policy to allow-prerelease."
+                )
 
-    data = {
-        "path": str(chosen),
-        "version": text,
-        "version_key": list(key),
-        "method": method(chosen),
-        "checked_epoch": time.time(),
-    }
-    save_json(CACHE, data)
-    return data
+        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        key, _, chosen, text, prerelease = ranked[0]
+
+        data = {
+            "path": str(chosen),
+            "version": text,
+            "version_key": list(key),
+            "prerelease": prerelease,
+            "policy": policy,
+            "method": method(chosen),
+            "checked_epoch": time.time(),
+        }
+        save_json(CACHE, data)
+        return data
 
 
 def main() -> None:

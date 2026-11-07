@@ -14,6 +14,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
+import select
 from typing import Any
 
 ROOT = Path(os.environ.get("CODEX_ACCOUNT_MANAGER_HOME", Path.home() / ".codex-manager"))
@@ -32,6 +34,9 @@ DEFAULT_CFG = {
     "no_daemon": True,
     "auto_schedule": True,
     "schedule_grace_seconds": 20,
+    "usage_probe_ttl_seconds": 120,
+    "account_scoring": True,
+    "pending_retention_days": 30,
     "continuation_prompt": (
         "A sessão anterior foi interrompida apenas por limite de uso da conta. "
         "Continue a execução do último pedido do usuário a partir do último estado válido. "
@@ -227,8 +232,23 @@ def meta(st: dict[str, Any], n: str) -> dict[str, Any]:
             "last_success": None,
             "last_failure": None,
             "last_error": None,
+            "usage": None,
+            "usage_checked_at": None,
         },
     )
+
+
+def usage_headroom(m: dict[str, Any]) -> int:
+    usage = m.get("usage") or {}
+    if usage.get("ordinary_usage_allowed") is False:
+        return -1
+    windows = usage.get("windows") or []
+    remaining = [
+        max(0, 100 - int(w.get("used_percent", 0)))
+        for w in windows
+        if w.get("used_percent") is not None
+    ]
+    return min(remaining) if remaining else 50
 
 
 def available(st: dict[str, Any], exclude: set[str] | None = None) -> list[str]:
@@ -241,18 +261,27 @@ def available(st: dict[str, Any], exclude: set[str] | None = None) -> list[str]:
         cd = parse_iso(m.get("cooldown_until"))
         if cd and cd > t:
             continue
-        # needs-login has no automatic recovery point; do not retry it blindly.
         if m.get("status") == "needs-login":
+            continue
+        if (m.get("usage") or {}).get("ordinary_usage_allowed") is False:
             continue
         out.append(n)
 
     pref = st.get("preferred")
+    scoring = bool(cfg().get("account_scoring", True))
 
     def key(n: str):
         m = st["accounts"][n]
         last = parse_iso(m.get("last_success")) or dt.datetime.min.replace(
             tzinfo=dt.timezone.utc
         )
+        if scoring:
+            return (
+                usage_headroom(m),
+                int(m.get("priority", 100)),
+                1 if n == pref else 0,
+                last.timestamp(),
+            )
         return (
             1 if n == pref else 0,
             int(m.get("priority", 100)),
@@ -286,10 +315,9 @@ def classify(text: str) -> str:
 
 
 def infer_reset(text: str) -> dt.datetime:
-    # ISO-ish timestamp if the CLI exposes one.
     patterns = [
-        r"(20\d{2}-\d{2}-\d{2}T[0-9:.+-]+Z?)",
-        r"(20\d{2}-\d{2}-\d{2} [0-9]{2}:[0-9]{2}(?::[0-9]{2})?(?: ?[+-][0-9:]+)?)",
+        r"(20\\d{2}-\\d{2}-\\d{2}T[0-9:.+-]+Z?)",
+        r"(20\\d{2}-\\d{2}-\\d{2} [0-9]{2}:[0-9]{2}(?::[0-9]{2})?(?: ?[+-][0-9:]+)?)",
     ]
     for pat in patterns:
         m = re.search(pat, text)
@@ -305,10 +333,9 @@ def infer_reset(text: str) -> dt.datetime:
         except Exception:
             pass
 
-    # Common human durations, e.g. "try again in 42 minutes" / "in 2 hours".
     m = re.search(
         r"(?:try again|reset(?:s)?|available again).*?"
-        r"(?:in\s+)?(\d+)\s*(minute|minutes|min|hour|hours|hr|hrs)",
+        r"(?:in\\s+)?(\\d+)\\s*(minute|minutes|min|hour|hours|hr|hrs)",
         text,
         re.I,
     )
@@ -322,7 +349,150 @@ def infer_reset(text: str) -> dt.datetime:
         )
         return utcnow() + delta
 
+    m = re.search(
+        r"(?:try again|reset(?:s)?|available again).*?at\\s+"
+        r"(\\d{1,2}):(\\d{2})(?:\\s*(AM|PM))?",
+        text,
+        re.I,
+    )
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2))
+        ampm = (m.group(3) or "").upper()
+        if ampm:
+            hour %= 12
+            if ampm == "PM":
+                hour += 12
+        local_now = dt.datetime.now().astimezone()
+        candidate = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= local_now + dt.timedelta(seconds=30):
+            candidate += dt.timedelta(days=1)
+        return candidate.astimezone(dt.timezone.utc)
+
     return utcnow() + dt.timedelta(minutes=int(cfg()["default_cooldown_minutes"]))
+
+
+
+def _app_server_wait(p: subprocess.Popen, req_id: int, timeout: float = 8.0) -> dict[str, Any]:
+    assert p.stdout is not None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        ready, _, _ = select.select([p.stdout], [], [], remaining)
+        if not ready:
+            break
+        line = p.stdout.readline()
+        if not line:
+            break
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if msg.get("id") == req_id:
+            return msg
+    raise TimeoutError(f"app-server timeout waiting for request {req_id}")
+
+
+def probe_usage(n: str) -> dict[str, Any] | None:
+    p = subprocess.Popen(
+        [codex_real(), "app-server"],
+        env=env_for(n),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+    assert p.stdin is not None
+    resp: dict[str, Any] = {}
+    try:
+        def send(msg: dict[str, Any]) -> None:
+            p.stdin.write(json.dumps(msg) + "\\n")
+            p.stdin.flush()
+
+        send({"id": 1, "method": "initialize",
+              "params": {"clientInfo": {"name": "codex-manager", "version": "1.3"}}})
+        _app_server_wait(p, 1)
+        send({"method": "initialized"})
+        send({"id": 2, "method": "account/rateLimits/read"})
+        resp = _app_server_wait(p, 2)
+    except (OSError, TimeoutError, BrokenPipeError):
+        return None
+    finally:
+        try:
+            p.stdin.close()
+        except Exception:
+            pass
+        try:
+            p.terminate()
+            p.wait(timeout=2)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    if "error" in resp:
+        return None
+
+    result = resp.get("result") or {}
+    snap = result.get("rateLimits") or {}
+    windows: list[dict[str, Any]] = []
+    for slot in ("primary", "secondary"):
+        w = snap.get(slot)
+        if not w:
+            continue
+        windows.append({
+            "slot": slot,
+            "used_percent": w.get("usedPercent"),
+            "window_duration_mins": w.get("windowDurationMins"),
+            "resets_at": w.get("resetsAt"),
+        })
+    return {
+        "ordinary_usage_allowed": result.get("ordinaryUsageAllowed"),
+        "account_id": result.get("accountId"),
+        "windows": windows,
+    }
+
+
+def refresh_usage_pool(force: bool = False) -> None:
+    if not cfg().get("account_scoring", True):
+        return
+    ttl = int(cfg().get("usage_probe_ttl_seconds", 120))
+    snapshot = state()
+    now = utcnow()
+    targets: list[str] = []
+    for n, m in snapshot["accounts"].items():
+        if not m.get("enabled", True) or m.get("status") == "needs-login":
+            continue
+        checked = parse_iso(m.get("usage_checked_at"))
+        if force or not checked or (now - checked).total_seconds() >= ttl:
+            targets.append(n)
+
+    for n in targets:
+        usage = probe_usage(n)
+        with FileLock():
+            st = state()
+            m = meta(st, n)
+            m["usage_checked_at"] = iso(utcnow())
+            if usage is not None:
+                m["usage"] = usage
+                allowed = usage.get("ordinary_usage_allowed")
+                if allowed is False:
+                    future = [
+                        int(w["resets_at"])
+                        for w in usage.get("windows", [])
+                        if w.get("resets_at") and int(w["resets_at"]) > time.time()
+                    ]
+                    m["status"] = "limited"
+                    if future:
+                        m["cooldown_until"] = iso(
+                            dt.datetime.fromtimestamp(min(future), tz=dt.timezone.utc)
+                        )
+                elif allowed is True and m.get("status") == "limited":
+                    m["status"] = "healthy"
+                    m["cooldown_until"] = None
+            save(STATE, st)
 
 
 def mark_ok(n: str) -> None:
@@ -395,12 +565,76 @@ def stream(cmd: list[str], e: dict[str, str]) -> tuple[int, str]:
     return p.wait(), "".join(tail)
 
 
+def run_exec_json(
+    exec_args: list[str],
+    account: str,
+) -> tuple[int, str, str | None]:
+    raw_json = "--json" in exec_args or "--experimental-json" in exec_args
+    args = list(exec_args)
+    if not raw_json:
+        args.insert(0, "--json")
+
+    cmd = [codex_real(), "exec", *args]
+    p = subprocess.Popen(
+        cmd,
+        env=env_for(account),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert p.stdout is not None
+    tail: list[str] = []
+    thread_id: str | None = None
+
+    for line in p.stdout:
+        stripped = line.rstrip("\\n")
+        event: dict[str, Any] | None = None
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict):
+                event = parsed
+        except json.JSONDecodeError:
+            pass
+
+        if event is None:
+            print(stripped, file=sys.stderr)
+            tail.append(stripped)
+        else:
+            etype = event.get("type")
+            if etype == "thread.started":
+                thread_id = event.get("thread_id") or thread_id
+            if raw_json:
+                print(stripped)
+            else:
+                if etype == "item.completed":
+                    item = event.get("item") or {}
+                    if item.get("type") == "agent_message" and item.get("text"):
+                        print(item["text"])
+                elif etype == "error":
+                    if event.get("message"):
+                        print(event["message"], file=sys.stderr)
+                elif etype == "turn.failed":
+                    err = event.get("error") or {}
+                    if err.get("message"):
+                        print(err["message"], file=sys.stderr)
+
+            if etype in ("error", "turn.failed"):
+                msg = event.get("message") or (event.get("error") or {}).get("message")
+                if msg:
+                    tail.append(str(msg))
+        if len(tail) > 500:
+            tail.pop(0)
+
+    return p.wait(), "\\n".join(tail), thread_id
+
+
 def pending_path(session: str) -> Path:
     return PENDING / f"{session}.json"
 
 
-def unit_base(session: str) -> str:
-    compact = session.replace("-", "")
+def unit_base(job_id: str) -> str:
+    compact = re.sub(r"[^A-Za-z0-9]", "", job_id)
     return f"codex-resume-{compact}"
 
 
@@ -416,7 +650,7 @@ def systemctl_user(*args: str, check: bool = False) -> subprocess.CompletedProce
 
 def systemd_quote(s: str) -> str:
     # systemd unit syntax accepts C-style escaped strings inside double quotes.
-    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
 
 
 def remove_units(session: str) -> None:
@@ -435,37 +669,38 @@ def remove_units(session: str) -> None:
 
 
 def schedule_resume(
-    session: str,
+    job_id: str,
     project: str,
     when: dt.datetime,
     reason: str = "all-accounts-limited",
+    *,
+    mode: str = "resume",
+    session_id: str | None = None,
+    exec_args: list[str] | None = None,
 ) -> None:
     ensure_layout()
     grace = int(cfg().get("schedule_grace_seconds", 20))
     when = when + dt.timedelta(seconds=grace)
-    base = unit_base(session)
+    base = unit_base(job_id)
     timer_name = f"{base}.timer"
     service_name = f"{base}.service"
     timer_path = USER_SYSTEMD / timer_name
     service_path = USER_SYSTEMD / service_name
-
-    # Idempotent: replace any prior timer for the same logical Codex session.
     systemctl_user("disable", "--now", timer_name)
 
     manager = manager_bin()
     project_path = str(Path(project).expanduser().resolve())
     service = f"""[Unit]
-Description=Resume Codex session {session}
+Description=Resume Codex job {job_id}
 
 [Service]
 Type=oneshot
 WorkingDirectory={systemd_quote(project_path)}
-ExecStart={systemd_quote(manager)} resume-session {systemd_quote(session)}
+ExecStart={systemd_quote(manager)} resume-job {systemd_quote(job_id)}
 """
-    # Use UTC explicitly so DST/local timezone ambiguity cannot move the job.
     calendar = when.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     timer = f"""[Unit]
-Description=Schedule Codex session {session}
+Description=Schedule Codex job {job_id}
 
 [Timer]
 OnCalendar={calendar}
@@ -476,19 +711,18 @@ Unit={service_name}
 [Install]
 WantedBy=timers.target
 """
-
     service_path.write_text(service)
     timer_path.write_text(timer)
     systemctl_user("daemon-reload", check=True)
     p = systemctl_user("enable", "--now", timer_name)
     if p.returncode != 0:
-        raise SystemExit(
-            "Falha ao criar timer systemd --user:\n"
-            + (p.stderr or p.stdout)
-        )
+        raise SystemExit("Falha ao criar timer systemd --user:\\n" + (p.stderr or p.stdout))
 
     record = {
-        "session_id": session,
+        "job_id": job_id,
+        "session_id": session_id,
+        "mode": mode,
+        "exec_args": exec_args or [],
         "project": project_path,
         "scheduled_for": iso(when),
         "created_at": iso(utcnow()),
@@ -496,19 +730,24 @@ WantedBy=timers.target
         "unit": base,
         "status": "scheduled",
     }
-    save(pending_path(session), record)
+    save(pending_path(job_id), record)
 
     print(
-        f"[codex-account] todas as contas estão indisponíveis.\n"
-        f"[codex-account] retomada agendada para {local_display(when)}\n"
-        f"[codex-account] sessão: {session}\n"
+        f"[codex-account] todas as contas estão indisponíveis.\\n"
+        f"[codex-account] retomada agendada para {local_display(when)}\\n"
+        f"[codex-account] job: {job_id}\\n"
         f"[codex-account] projeto: {project_path}",
         file=sys.stderr,
     )
 
 
-def finish_pending(session: str, status: str, extra: dict[str, Any] | None = None) -> None:
-    p = pending_path(session)
+def deactivate_units(job_id: str) -> None:
+    base = unit_base(job_id)
+    systemctl_user("disable", "--now", f"{base}.timer")
+
+
+def finish_pending(job_id: str, status: str, extra: dict[str, Any] | None = None) -> None:
+    p = pending_path(job_id)
     rec = load(p, {}) if p.exists() else {}
     rec["status"] = status
     rec["updated_at"] = iso(utcnow())
@@ -518,15 +757,28 @@ def finish_pending(session: str, status: str, extra: dict[str, Any] | None = Non
         save(p, rec)
 
 
-def maybe_schedule(session: str | None, project: str, reason: str) -> bool:
-    if not session or not cfg().get("auto_schedule", True):
-        return False
+def maybe_schedule(
+    session: str | None,
+    project: str,
+    reason: str,
+    exec_args: list[str] | None = None,
+) -> str | None:
+    if not cfg().get("auto_schedule", True):
+        return None
     nr = next_reset(state())
     if not nr:
-        return False
-    _, when = nr
-    schedule_resume(session, project, when, reason)
-    return True
+        return None
+    job_id = session or str(uuid.uuid4())
+    schedule_resume(
+        job_id,
+        project,
+        nr[1],
+        reason,
+        mode="resume" if session else "fresh",
+        session_id=session,
+        exec_args=exec_args or [],
+    )
+    return job_id
 
 
 def bootstrap(a) -> None:
@@ -593,7 +845,7 @@ def list_cmd(_) -> None:
     ensure_layout()
     st = state()
     print(
-        f"{'NAME':20} {'STATUS':12} {'PRIO':>5} "
+        f"{'NAME':20} {'STATUS':12} {'PRIO':>5} {'HEADROOM':>8} "
         f"{'RESET/COOLDOWN':24} {'LAST SUCCESS'}"
     )
     for n, m in sorted(st["accounts"].items()):
@@ -601,7 +853,7 @@ def list_cmd(_) -> None:
         reset = local_display(parse_iso(m.get("cooldown_until")))
         print(
             f"{p}{n:19} {m.get('status','unknown'):12} "
-            f"{m.get('priority',100):5} {reset:24} "
+            f"{m.get('priority',100):5} {usage_headroom(m):8} {reset:24} "
             f"{m.get('last_success') or '-'}"
         )
     nr = next_reset(st)
@@ -677,16 +929,22 @@ def run(a) -> None:
 
 def exec_cmd(a) -> None:
     ensure_layout()
+    refresh_usage_pool()
     attempted: set[str] = set()
     session: str | None = None
-    first = True
     c = cfg()
     project = os.getcwd()
 
     while True:
         choices = available(state(), attempted)
         if not choices:
-            if maybe_schedule(session, project, "all-accounts-limited"):
+            job = maybe_schedule(
+                session,
+                project,
+                "all-accounts-limited",
+                a.codex_args if session is None else None,
+            )
+            if job:
                 raise SystemExit(75)
             nr = next_reset(state())
             if nr:
@@ -701,29 +959,20 @@ def exec_cmd(a) -> None:
         n = choices[0]
         attempted.add(n)
         links(n)
-        started = time.time()
 
-        if first:
-            cmd = [codex_real(), "exec"] + a.codex_args
+        if session:
+            args = ["resume", session, c["continuation_prompt"]]
+            mode = "resume"
         else:
-            if not session:
-                raise SystemExit("SESSION_ID ausente para resume.")
-            cmd = [
-                codex_real(),
-                "exec",
-                "resume",
-                session,
-                c["continuation_prompt"],
-            ]
+            args = list(a.codex_args)
+            mode = "fresh"
 
-        print(f"[codex-account] exec usando: {n}", file=sys.stderr)
-        rc, out = stream(cmd, env_for(n))
+        print(f"[codex-account] exec usando: {n} ({mode})", file=sys.stderr)
+        rc, out, observed_session = run_exec_json(args, n)
+        session = session or observed_session
 
         if rc == 0:
             mark_ok(n)
-            if session and pending_path(session).exists():
-                finish_pending(session, "completed", {"completed_at": iso(utcnow())})
-                remove_units(session)
             return
 
         kind = classify(out)
@@ -732,62 +981,64 @@ def exec_cmd(a) -> None:
         if kind != "quota":
             raise SystemExit(rc)
 
-        if first:
-            session = newest_session(started)
-            first = False
-
-        if not session:
-            raise SystemExit(
-                "Limite detectado, mas não consegui identificar SESSION_ID para resume."
+        if session:
+            print(
+                f"[codex-account] limite em {n}; retomando thread {session} em outra conta...",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[codex-account] limite em {n} antes da criação da thread; "
+                "reexecutando o pedido original em outra conta...",
+                file=sys.stderr,
             )
 
-        print(
-            f"[codex-account] limite em {n}; retomando {session} em outra conta...",
-            file=sys.stderr,
-        )
 
-
-def resume_session(a) -> None:
+def resume_job(a) -> None:
     ensure_layout()
-    session = a.session_id
-    p = pending_path(session)
+    job_id = a.job_id
+    p = pending_path(job_id)
     rec = load(p, {})
+    if not rec:
+        rec = {"job_id": job_id, "session_id": job_id, "mode": "resume", "exec_args": []}
     project = rec.get("project") or os.getcwd()
     attempted: set[str] = set()
     c = cfg()
+    session = rec.get("session_id")
+    mode = rec.get("mode") or ("resume" if session else "fresh")
+    original_args = list(rec.get("exec_args") or [])
 
-    # Disable the firing timer immediately. If another schedule is needed,
-    # schedule_resume will recreate it.
-    base = unit_base(session)
-    systemctl_user("disable", "--now", f"{base}.timer")
+    deactivate_units(job_id)
 
     try:
         os.chdir(project)
     except OSError as e:
-        finish_pending(session, "failed", {"error": f"project unavailable: {e}"})
+        finish_pending(job_id, "failed", {"error": f"project unavailable: {e}"})
         raise SystemExit(f"Diretório do projeto indisponível: {project}: {e}")
+
+    refresh_usage_pool()
 
     while True:
         choices = available(state(), attempted)
         if not choices:
             nr = next_reset(state())
             if nr:
-                schedule_resume(session, project, nr[1], "still-limited-after-scheduled-resume")
+                schedule_resume(
+                    job_id, project, nr[1],
+                    "still-limited-after-scheduled-resume",
+                    mode=mode, session_id=session, exec_args=original_args,
+                )
                 finish_pending(
-                    session,
-                    "scheduled",
+                    job_id, "scheduled",
                     {"scheduled_for": iso(nr[1]), "last_attempt": iso(utcnow())},
                 )
                 return
             finish_pending(
-                session,
-                "blocked",
-                {
-                    "last_attempt": iso(utcnow()),
-                    "error": "Nenhuma conta com recuperação automática disponível.",
-                },
+                job_id, "blocked",
+                {"last_attempt": iso(utcnow()),
+                 "error": "Nenhuma conta com recuperação automática disponível."},
             )
-            remove_units(session)
+            deactivate_units(job_id)
             raise SystemExit(
                 "Retomada bloqueada: nenhuma conta disponível e nenhum cooldown futuro."
             )
@@ -795,74 +1046,97 @@ def resume_session(a) -> None:
         n = choices[0]
         attempted.add(n)
         links(n)
-        print(
-            f"[codex-account] retomada agendada usando conta: {n}",
-            file=sys.stderr,
-        )
-        cmd = [
-            codex_real(),
-            "exec",
-            "resume",
-            session,
-            c["continuation_prompt"],
-        ]
-        rc, out = stream(cmd, env_for(n))
+        print(f"[codex-account] retomada usando conta: {n}", file=sys.stderr)
+
+        args = ["resume", session, c["continuation_prompt"]] if session else list(original_args)
+        rc, out, observed_session = run_exec_json(args, n)
+        session = session or observed_session
+        if session:
+            mode = "resume"
 
         if rc == 0:
             mark_ok(n)
             finish_pending(
-                session,
-                "completed",
-                {
-                    "completed_at": iso(utcnow()),
-                    "account": n,
-                },
+                job_id, "completed",
+                {"completed_at": iso(utcnow()), "account": n, "session_id": session},
             )
-            remove_units(session)
+            deactivate_units(job_id)
             return
 
         kind = classify(out)
         mark_fail(n, kind, out)
-
         if kind != "quota":
             finish_pending(
-                session,
-                "failed",
-                {
-                    "last_attempt": iso(utcnow()),
-                    "account": n,
-                    "error": out[-4000:],
-                },
+                job_id, "failed",
+                {"last_attempt": iso(utcnow()), "account": n,
+                 "error": out[-4000:], "session_id": session},
             )
-            remove_units(session)
+            deactivate_units(job_id)
             raise SystemExit(rc)
 
-        # quota: try another account immediately; if none remain, loop will
-        # schedule the next known reset.
+
+def resume_session(a) -> None:
+    class Args:
+        job_id = a.session_id
+    resume_job(Args())
 
 
-def pending_cmd(_) -> None:
+def pending_cmd(a) -> None:
     ensure_layout()
     files = sorted(PENDING.glob("*.json"))
-    if not files:
-        print("Nenhuma retomada registrada.")
-        return
-
-    print(f"{'SESSION':36} {'STATUS':12} {'SCHEDULED':24} PROJECT")
+    records: list[tuple[Path, dict[str, Any]]] = []
+    active = {"scheduled", "blocked"}
     for p in files:
         rec = load(p, {})
+        if a.all or rec.get("status") in active:
+            records.append((p, rec))
+
+    if not records:
+        print("Nenhuma retomada pendente." if not a.all else "Nenhuma retomada registrada.")
+        return
+
+    print(f"{'JOB':36} {'MODE':8} {'STATUS':12} {'SCHEDULED':24} PROJECT")
+    for p, rec in records:
         scheduled = local_display(parse_iso(rec.get("scheduled_for")))
         print(
-            f"{rec.get('session_id', p.stem):36} "
+            f"{rec.get('job_id', rec.get('session_id', p.stem)):36} "
+            f"{rec.get('mode','resume'):8} "
             f"{rec.get('status','unknown'):12} "
             f"{scheduled:24} "
             f"{rec.get('project','-')}"
         )
 
 
+def gc_cmd(a) -> None:
+    ensure_layout()
+    days = a.days if a.days is not None else int(cfg().get("pending_retention_days", 30))
+    cutoff = utcnow() - dt.timedelta(days=days)
+    removed = 0
+    for p in PENDING.glob("*.json"):
+        rec = load(p, {})
+        if rec.get("status") in {"scheduled", "blocked"}:
+            continue
+        stamp = (
+            parse_iso(rec.get("updated_at"))
+            or parse_iso(rec.get("completed_at"))
+            or parse_iso(rec.get("cancelled_at"))
+            or parse_iso(rec.get("created_at"))
+        )
+        if stamp and stamp > cutoff:
+            continue
+        job_id = rec.get("job_id") or rec.get("session_id") or p.stem
+        remove_units(job_id)
+        try:
+            p.unlink()
+            removed += 1
+        except FileNotFoundError:
+            pass
+    print(f"Registros removidos: {removed}")
+
+
 def cancel_cmd(a) -> None:
     ensure_layout()
-    session = a.session_id
+    session = a.job_id
     remove_units(session)
     p = pending_path(session)
     if p.exists():
@@ -871,6 +1145,13 @@ def cancel_cmd(a) -> None:
         rec["cancelled_at"] = iso(utcnow())
         save(p, rec)
     print(f"Retomada cancelada: {session}")
+
+
+
+def usage_cmd(a) -> None:
+    ensure_layout()
+    refresh_usage_pool(force=True)
+    list_cmd(a)
 
 
 def doctor(_) -> None:
@@ -885,6 +1166,40 @@ def doctor(_) -> None:
         print("ERRO:", e)
         real = None
         problems += 1
+
+
+    if real:
+        checks = [
+            ([real, "--version"], None),
+            ([real, "exec", "--help"], ("--json", "resume")),
+            ([real, "app-server", "--help"], None),
+        ]
+        compat_ok = True
+        for command, required in checks:
+            try:
+                q = subprocess.run(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=15,
+                )
+            except (OSError, subprocess.TimeoutExpired) as e:
+                print("ERRO compatibilidade:", e)
+                problems += 1
+                compat_ok = False
+                continue
+            if q.returncode != 0:
+                print("ERRO compatibilidade:", " ".join(command[1:]))
+                problems += 1
+                compat_ok = False
+                continue
+            if required and not all(token in q.stdout for token in required):
+                print("ERRO compatibilidade: recursos ausentes em", " ".join(command[1:]))
+                problems += 1
+                compat_ok = False
+        if compat_ok:
+            print("compatibilidade CLI: ok")
 
     print("shared sqlite:", SHARED / "sqlite")
     print("systemd user dir:", USER_SYSTEMD)
@@ -972,12 +1287,24 @@ def parser():
     x.add_argument("session_id")
     x.set_defaults(func=resume_session)
 
+    x = s.add_parser("resume-job")
+    x.add_argument("job_id")
+    x.set_defaults(func=resume_job)
+
     x = s.add_parser("pending")
+    x.add_argument("--all", action="store_true")
     x.set_defaults(func=pending_cmd)
 
+    x = s.add_parser("gc")
+    x.add_argument("--days", type=int)
+    x.set_defaults(func=gc_cmd)
+
     x = s.add_parser("cancel")
-    x.add_argument("session_id")
+    x.add_argument("job_id")
     x.set_defaults(func=cancel_cmd)
+
+    x = s.add_parser("usage")
+    x.set_defaults(func=usage_cmd)
 
     x = s.add_parser("doctor")
     x.set_defaults(func=doctor)
