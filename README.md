@@ -1,44 +1,242 @@
-# Codex Account Manager ‚Äî v1.1
+# Codex Account Manager - v1.2
 
-Gerenciador local para m√∫ltiplas contas do Codex CLI, com failover e retomada agendada.
+Local multi-account manager for the Codex CLI.
 
-## O que a v1.1 acrescenta
+It keeps account authentication isolated while sharing Codex sessions/configuration,
+supports automatic account failover for `codex exec`, and can schedule session resume
+with `systemd --user` when every account is temporarily rate-limited.
 
-Quando `codex exec` esgota todas as contas dispon√≠veis:
+## v1.2: transparent Codex runtime updates
 
-1. o manager preserva o `SESSION_ID`;
-2. identifica o primeiro `cooldown_until`;
-3. registra a sess√£o pendente;
-4. cria um `systemd --user` timer persistente;
-5. no hor√°rio, escolhe novamente a melhor conta dispon√≠vel;
-6. executa `codex exec resume <SESSION_ID>` com o prompt de continuidade;
-7. se a conta ainda estiver limitada, tenta as demais e, se necess√°rio, agenda novamente para o pr√≥ximo reset.
+v1.1 installed the manager wrapper directly at:
 
-O terminal n√£o precisa ficar aberto.
+```text
+~/.local/bin/codex
+```
 
-## Instala√ß√£o / upgrade
+That collides with the default visible command used by the official Codex standalone
+installer.
+
+v1.2 separates the two responsibilities:
+
+```text
+~/.local/lib/codex-manager/bin/codex   manager wrapper
+~/.local/lib/codex-manager/codex-runtime  runtime launcher
+~/.local/bin/codex                     free for official Codex
+```
+
+The manager's `codex_real` now points to the stable `codex-runtime` launcher rather
+than to one specific Codex release.
+
+The runtime launcher discovers the actual official Codex automatically from:
+
+- the legacy v1.1 runtime target, preserved as a hint;
+- `~/.local/bin/codex`;
+- the default standalone installation under `~/.codex/packages/standalone`;
+- standalone installations under managed account `CODEX_HOME` directories;
+- other Codex installations visible on `PATH` (npm, bun, system installs).
+
+When multiple runtimes are found, it probes their versions and selects the newest
+detectable version. Discovery is cached for 300 seconds by default.
+
+This means an official Codex update can replace its own binary/symlink without
+overwriting the manager wrapper.
+
+## Install / upgrade
+
+From the cloned repository:
 
 ```bash
-tar -xzf codex-account-manager-v1.1.tar.gz
-cd codex-account-manager
+git pull origin main
 ./install.sh
+source ~/.bashrc
 ```
 
-O instalador preserva `~/.codex-manager/manager.json`, `state.json`, contas e sess√µes existentes. Se a v1 j√° estiver instalada, ele reaproveita o `codex_real` salvo para n√£o confundir o wrapper com o bin√°rio real.
-
-Garanta:
+Then validate:
 
 ```bash
-export PATH="$HOME/.local/bin:$PATH"
+which codex
+~/.local/lib/codex-manager/codex-runtime --manager-runtime-info
+codex-account doctor
+codex-account list
 ```
 
-## Estrutura
+Expected `which codex`:
+
+```text
+~/.local/lib/codex-manager/bin/codex
+```
+
+The official Codex can still live at `~/.local/bin/codex`; our wrapper wins because
+its dedicated directory is prepended to `PATH`.
+
+## Force runtime rediscovery
+
+Normally rediscovery happens automatically after the cache TTL.
+
+To force it immediately:
+
+```bash
+~/.local/lib/codex-manager/codex-runtime --manager-runtime-refresh
+```
+
+To inspect without changing normal CLI behavior:
+
+```bash
+~/.local/lib/codex-manager/codex-runtime --manager-runtime-info
+```
+
+Example:
+
+```json
+{
+  "method": "standalone",
+  "path": "/home/user/.local/bin/codex",
+  "version": "codex-cli 0.x.y"
+}
+```
+
+## Accounts
+
+Import the current Codex account:
+
+```bash
+codex-account bootstrap principal
+```
+
+Add more accounts:
+
+```bash
+codex-account add secundaria
+codex-account add terceira
+```
+
+List:
+
+```bash
+codex-account list
+```
+
+Choose a preferred account:
+
+```bash
+codex-account use secundaria
+```
+
+## Normal use
+
+Interactive:
+
+```bash
+codex
+```
+
+Non-interactive with automatic failover:
+
+```bash
+codex exec "implement the next milestone"
+```
+
+If one account reaches its usage limit, the manager marks it unavailable and resumes
+the same Codex session with another account.
+
+## All accounts limited
+
+For `codex exec`, if all accounts are unavailable, the manager records the session and
+creates a persistent `systemd --user` timer for the earliest known reset.
+
+Inspect pending resumes:
+
+```bash
+codex-account pending
+systemctl --user list-timers 'codex-resume-*'
+```
+
+Cancel:
+
+```bash
+codex-account cancel <SESSION_ID>
+```
+
+Force resume now:
+
+```bash
+codex-account resume-session <SESSION_ID>
+```
+
+## Layout
 
 ```text
 ~/.codex-manager/
-‚îú‚îÄ‚îÄ accounts/
-‚îÇ   ‚îú‚îÄ‚îÄ principal/home/
-‚îÇ   ‚îú‚îÄ‚îÄ secundaria/home/
-‚îÇ   ‚îî‚îÄ‚îÄ ...
-‚îú‚îÄ‚îÄ shared/
-‚îÇ   ‚îú‚îÄ‚îÄÅçΩπô•úπ—Ωµ∞+äRÄÄÉäRsäRäR6W76ñˆÁ2Æ)H")IŒ)H)H&6ÜófVE˜6W76ñˆÁ2Æ)H")IŒ)H)H⁄⁄[À¬∏• à8•'8• 8• ù[\À¬∏• à8•%8• 8• ‹[]K¬∏•'8• 8• [ô[ôÀ¬∏• à8•%8• 8• —T‘“S”ó“Qãöú€€Ç∏•'8• 8• X[òYŸ\ãöú€€Ç∏•%8• 8• ›]Köú€€ÇòÇì‹»[Y\ú»Ë€»‹ò]òY‹»[NÇÇò^üãÀò€€ôöYÀ‹ﬁ\›[Y›\Ÿ\ãÿ€Ÿ^\ô\›[YKO—T‘“S”ó“Qãù[Y\ÇüãÀò€€ôöYÀ‹ﬁ\›[Y›\Ÿ\ãÿ€Ÿ^\ô\›[YKO—T‘“S”ó“QãúŸ\ùöXŸBòÇà»»õ^»]]€pË]X€¬Çï\€»õ‹õX[ÇÇòò\⁄ò€Ÿ^^X»ö[\[Y[ùHH∞Ïﬁ[XHZ[\›€ôHÇòÇë^[\ŒÇÇò^úö[ò⁄\[à8°§»][›BúŸX›[ô\öXBà8°§»][›Bõô[ö[XH€€ùH\‹€∞Î]ô[à8°§¬õX[òYŸ\à[ò€€ùòH»ô\Ÿ]XZ\»∞Ïﬁ[[¬à8°§¬úﬁ\›[Y\Ÿ\à[Y\Çà8°§¬ö‹∞Ë\ö[»»ô\Ÿ]à8°§¬úô\›[YHHQT”PH—T‘“S”ó“QòÇì»õ€\]]€pË]X€»Hô]€XYH∞Ë€»[ùHôX€€ú›ùZ\àH€€ùô\úÿKàH€€ùô\úÿHôX[ô[HHŸ\‹Ë€»€€\\ù[YKà»õ€\\[ò\»‹öY[ùH»YŸ[ùHHô\öYöXÿ\à»\›Y»]X[»ô\‹⁄]0Ï‹ö[»H€€ù[ùX\àŸ[HôYò^ô\àòXò[ÀÇÇà»»ô\àô]€XY\»[ô[ù\¬Çòò\⁄ò€Ÿ^XXÿ€›[ù[ô[ô¬òÇîÿpÎYH\‹\òYNÇÇò^î—T‘“S”à’UT»–“QSQì“ëP’åNXÀããàÿ⁄Y[YåçãLLKLHçMHîï⁄€YKÀãããŸö[ò[ò⁄X[Ÿ[ô⁄[ôBòÇïõÿÍà[X∞Í[HŸH[ú‹X⁄[€ò\à‹»[Y\ú»\ô][Y[ùNÇÇòò\⁄úﬁ\›[X›K]\Ÿ\à\›][Y\ú»	ÿ€Ÿ^\ô\›[YKJâ¬òÇëH‹»Ÿ‹»H[XHô]€XYNÇÇòò\⁄öõ›\õò[›K]\Ÿ\à]H	ÿ€Ÿ^\ô\›[YKJãúŸ\ùöXŸI¬òÇà»»ÿ[òŸ[\à[XHô]€XYBÇòò\⁄ò€Ÿ^XXÿ€›[ùÿ[òŸ[—T‘“S”ó“QÇòÇí\‹€»\ÿXö[]H»[Y\àHX\òÿH»ôY⁄\›õ»€€[»ÿ[òŸ[YÇÇà»»õ‹∞Èÿ\àô]€XYHX[ùX[ÇêHõ›[òH\ÿYH[»ﬁ\›[Y[X∞Í[HŸHŸ\à⁄[XYH\ô][Y[ùNÇÇòò\⁄ò€Ÿ^XXÿ€›[ùô\›[YK\Ÿ\‹⁄[€à—T‘“S”ó“QÇòÇë[NÇãH\ÿ€€H[XH€€ùH\‹€∞Î]ô[¬ãHô]€XHHŸ\‹Ë€Œ¬ãH€\‹⁄YöXÿH\úõ»H][›N¬ãH[ùH›]òH€€ùN¬ãHYŸ[ôHõ›ò[Y[ùHŸHŸ\»€€ù[ùX\ô[H[Z]Y\ÀÇÇà»»€€ù\¬Çí[\‹ù\àH€€ùH]X[ÇÇòò\⁄ò€Ÿ^XXÿ€›[ùõ€››ò\ö[ò⁄\[òÇêYX⁄[€ò\à›]ò\ŒÇÇòò\⁄ò€Ÿ^XXÿ€›[ùYŸX›[ô\öXBò€Ÿ^XXÿ€›[ùY\òŸZ\òBòÇî›]\ŒÇÇòò\⁄ò€Ÿ^XXÿ€›[ù\›òÇî]X[ô»ô[ö[XH€€ùH\›0ËH\‹€∞Î]ô[\›[X∞Í[H[‹›òHH∞Ïﬁ[XH€€ùH[YÎ]ô[H»‹∞Ë\ö[»ÿÿ[»ô\Ÿ]ÇÇà»»XY€∞Ï‹›X€¬Çòò\⁄ò€Ÿ^XXÿ€›[ùÿ›‹ÇòÇê[0Í[H\»€€ù\ÀHåKåHô\öYöXÿHŸH»ﬁ\›[YK]\Ÿ\òô\‹€ôKÇÇà»»€€ôöY›\òpÈË€¬Çê\ú]Z]õŒÇÇò^üãÀò€Ÿ^[X[òYŸ\ã€X[òYŸ\ãöú€€ÇòÇìõ›ò\»‹0ÈÌY\ŒÇÇòú€€Çû¬àò]]◊‹ÿ⁄Y[HéàùYKàúÿ⁄Y[WŸ‹òXŸW‹ŸX€€ô»éàåàôYò][ÿ€€€›€ó€Z[ù]\»éàÃüBòÇò]]◊‹ÿ⁄Y[OYò[ŸX\ÿ]]òHH‹öXpÈË€»]]€pË]XÿHH[Y\úÀÇÇòÿ⁄Y[WŸ‹òXŸW‹ŸX€€ôÿYX⁄[€òH[XH\]Y[òHX\ôŸ[H\⁄\»»‹∞Ë\ö[»\›[XY»Hô\Ÿ]]ö][ô»[ù\à^][Y[ùHõ»[Z]KÇÇîŸH»€Ÿ^∞Ë€»õ‹õôXŸ\à‹∞Ë\ö[ÀŸ\òpÈË€»ôX€€öXÎ]ô[»X[òYŸ\à\ÿHYò][ÿ€€€›€ó€Z[ù]\ÿÇÇà»»\ú⁄\›0Íõò⁄XH»ﬁ\›[YÇêHåKåH\ÿH\ú]Z]õ‹»ôXZ\»[HãÀò€€ôöYÀ‹ﬁ\›[Y›\Ÿ\ò€€NÇÇò[öBî\ú⁄\›[ù]ùYBòÇí\‹€»0ÍHXZ\»õÿù\›»]YH€Y\›H[Hﬁ\›[Y\ù[òò[ú⁄]0Ï‹ö[ÀàŸH»[Y\àô[òŸ\à[ú]X[ù»»\Ÿ\àX[òYŸ\à\›]ô\à\òYÀ»ﬁ\›[YŸH\‹\∞ËK[»òH∞Ïﬁ[XH]]òpÈË€»»\Ÿ\àX[òYŸ\ãÇÇêHpË\]Z[òHôX⁄\ÿH\›\àYÿYK‹ô]€XYH\òH]YH»€Ÿ^^X›]Kà»[Y\à∞Ë€»ò[úŸõ‹õXH»õ›Xõ€⁄»\€YÿY»[H[XHpË\]Z[òHH^X›pÈË€»ô[[›KÇÇà»»[Z]pÈË€»»RBÇêH]]€XpÈË€»€€\]H€€ù[ùXHõÿÿYH[H€Ÿ^^XÿÇÇìõ»RH[ù\ò]]õÀ»X[òYŸ\à∞Ë€»õÿÿH‹ôY[ò⁄XZ\»‹àòZ^»H[HõÿŸ\‹€»∞ËHXô\ùÀà\»Ÿ\‹ÌY\»\õX[ôXŸ[H€€\\ù[Y\ÀX\»HõÿÿHÿ€‹úôHòH∞Ïﬁ[XHXô\ù\òK‹ô\›[YKÇÇà»»õ€òX⁄¬ÇêH[ú›[pÈË€»‹öY⁄[ò[[HãÀò€Ÿ^€€ù[ùXH[ùX›KÇÇî\òHô]\ò\à»‹ò\\éÇÇòò\⁄úõHãÀõÿÿ[ÿö[ãÿ€Ÿ^òÇî\òHô[[›ô\à\[ò\»‹»[Y\ú»Hô]€XYH^\›[ù\ŒÇÇòò\⁄úﬁ\›[X›K]\Ÿ\à\›][Y\ú»	ÿ€Ÿ^\ô\›[YKJâ¬ò€Ÿ^XXÿ€›[ù[ô[ô¬ò€Ÿ^XXÿ€›[ùÿ[òŸ[—T‘“S”ó“QÇòÇî\òHô[[›ô\àŸ»»X[òYŸ\éÇÇòò\⁄úõHãÀõÿÿ[ÿö[ãÿ€Ÿ^XXÿ€›[ùúõH\ôàãÀò€Ÿ^[X[òYŸ\ÇòÇê[ù\»\‹€Àÿ[òŸ[H‹»[Y\ú»[ô[ù\ÀÇ
+|-- accounts/
+|   |-- principal/home/
+|   |-- secundaria/home/
+|   `-- ...
+|-- shared/
+|   |-- config.toml
+|   |-- sessions/
+|   |-- archived_sessions/
+|   |-- skills/
+|   |-- rules/
+|   `-- sqlite/
+|-- pending/
+|-- manager.json
+|-- runtime-cache.json
+`-- state.json
+
+~/.local/lib/codex-manager/
+|-- bin/codex
+`-- codex-runtime
+```
+
+## Diagnostics
+
+```bash
+codex-account doctor
+codex-account list
+~/.local/lib/codex-manager/codex-runtime --manager-runtime-info
+```
+
+For runtime selection debug on a normal invocation:
+
+```bash
+CODEX_MANAGER_RUNTIME_DEBUG=1 codex --version
+```
+
+## Configuration
+
+`~/.codex-manager/manager.json`
+
+Relevant v1.2 fields:
+
+```json
+{
+  "codex_real": "/home/user/.local/lib/codex-manager/codex-runtime",
+  "codex_runtime_hints": [],
+  "runtime_check_ttl_seconds": 300,
+  "auto_schedule": true,
+  "schedule_grace_seconds": 20,
+  "default_cooldown_minutes": 30
+}
+```
+
+## Rollback
+
+The original `~/.codex` account data is not removed by the manager.
+
+Remove the v1.2 wrapper:
+
+```bash
+rm ~/.local/lib/codex-manager/bin/codex
+```
+
+Then remove the PATH block between:
+
+```text
+# >>> codex-manager >>>
+# <<< codex-manager <<<
+```
+
+from `~/.bashrc`.
+
+The official `~/.local/bin/codex` remains untouched.
