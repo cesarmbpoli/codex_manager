@@ -316,8 +316,8 @@ def classify(text: str) -> str:
 
 def infer_reset(text: str) -> dt.datetime:
     patterns = [
-        r"(20\\d{2}-\\d{2}-\\d{2}T[0-9:.+-]+Z?)",
-        r"(20\\d{2}-\\d{2}-\\d{2} [0-9]{2}:[0-9]{2}(?::[0-9]{2})?(?: ?[+-][0-9:]+)?)",
+        r"(20\d{2}-\d{2}-\d{2}T[0-9:.+-]+Z?)",
+        r"(20\d{2}-\d{2}-\d{2} [0-9]{2}:[0-9]{2}(?::[0-9]{2})?(?: ?[+-][0-9:]+)?)",
     ]
     for pat in patterns:
         m = re.search(pat, text)
@@ -335,7 +335,7 @@ def infer_reset(text: str) -> dt.datetime:
 
     m = re.search(
         r"(?:try again|reset(?:s)?|available again).*?"
-        r"(?:in\\s+)?(\\d+)\\s*(minute|minutes|min|hour|hours|hr|hrs)",
+        r"(?:in\s+)?(\d+)\s*(minute|minutes|min|hour|hours|hr|hrs)",
         text,
         re.I,
     )
@@ -350,8 +350,8 @@ def infer_reset(text: str) -> dt.datetime:
         return utcnow() + delta
 
     m = re.search(
-        r"(?:try again|reset(?:s)?|available again).*?at\\s+"
-        r"(\\d{1,2}):(\\d{2})(?:\\s*(AM|PM))?",
+        r"(?:try again|reset(?:s)?|available again).*?at\s+"
+        r"(\d{1,2}):(\d{2})(?:\s*(AM|PM))?",
         text,
         re.I,
     )
@@ -407,7 +407,7 @@ def probe_usage(n: str) -> dict[str, Any] | None:
     resp: dict[str, Any] = {}
     try:
         def send(msg: dict[str, Any]) -> None:
-            p.stdin.write(json.dumps(msg) + "\\n")
+            p.stdin.write(json.dumps(msg) + "\n")
             p.stdin.flush()
 
         send({"id": 1, "method": "initialize",
@@ -588,7 +588,7 @@ def run_exec_json(
     thread_id: str | None = None
 
     for line in p.stdout:
-        stripped = line.rstrip("\\n")
+        stripped = line.rstrip("\n")
         event: dict[str, Any] | None = None
         try:
             parsed = json.loads(stripped)
@@ -626,7 +626,7 @@ def run_exec_json(
         if len(tail) > 500:
             tail.pop(0)
 
-    return p.wait(), "\\n".join(tail), thread_id
+    return p.wait(), "\n".join(tail), thread_id
 
 
 def pending_path(session: str) -> Path:
@@ -716,7 +716,7 @@ WantedBy=timers.target
     systemctl_user("daemon-reload", check=True)
     p = systemctl_user("enable", "--now", timer_name)
     if p.returncode != 0:
-        raise SystemExit("Falha ao criar timer systemd --user:\\n" + (p.stderr or p.stdout))
+        raise SystemExit("Falha ao criar timer systemd --user:\n" + (p.stderr or p.stdout))
 
     record = {
         "job_id": job_id,
@@ -733,9 +733,9 @@ WantedBy=timers.target
     save(pending_path(job_id), record)
 
     print(
-        f"[codex-account] todas as contas estão indisponíveis.\\n"
-        f"[codex-account] retomada agendada para {local_display(when)}\\n"
-        f"[codex-account] job: {job_id}\\n"
+        f"[codex-account] todas as contas estão indisponíveis.\n"
+        f"[codex-account] retomada agendada para {local_display(when)}\n"
+        f"[codex-account] job: {job_id}\n"
         f"[codex-account] projeto: {project_path}",
         file=sys.stderr,
     )
