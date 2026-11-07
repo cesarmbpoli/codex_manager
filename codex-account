@@ -1,0 +1,990 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any
+
+ROOT = Path(os.environ.get("CODEX_ACCOUNT_MANAGER_HOME", Path.home() / ".codex-manager"))
+ACCOUNTS = ROOT / "accounts"
+SHARED = ROOT / "shared"
+PENDING = ROOT / "pending"
+STATE = ROOT / "state.json"
+CFG = ROOT / "manager.json"
+LOCK = ROOT / ".lock"
+USER_SYSTEMD = Path.home() / ".config/systemd/user"
+
+DEFAULT_CFG = {
+    "codex_real": None,
+    "manager_bin": str(Path.home() / ".local/bin/codex-account"),
+    "default_cooldown_minutes": 30,
+    "no_daemon": True,
+    "auto_schedule": True,
+    "schedule_grace_seconds": 20,
+    "continuation_prompt": (
+        "A sessão anterior foi interrompida apenas por limite de uso da conta. "
+        "Continue a execução do último pedido do usuário a partir do último estado válido. "
+        "Antes de prosseguir, verifique o estado atual do repositório e arquivos modificados; "
+        "não reverta alterações já aplicadas, não repita trabalho concluído e use o histórico "
+        "desta sessão como fonte de contexto."
+    ),
+}
+DEFAULT_STATE = {"preferred": None, "accounts": {}}
+
+QUOTA = [
+    r"you.?ve hit your usage limit",
+    r"usage limit reached",
+    r"usage limit exceeded",
+    r"workspace is out of credits",
+    r"spend cap",
+    r"quota exceeded",
+    r"usage not included",
+    r"out of credits",
+]
+AUTH = [
+    r"not logged in",
+    r"login required",
+    r"authentication failed",
+    r"unauthorized",
+    r"invalid.*token",
+]
+UUID_RE = re.compile(
+    r"(?P<id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+    r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12})"
+)
+
+
+def utcnow() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def iso(x: dt.datetime | None) -> str | None:
+    return x.astimezone(dt.timezone.utc).isoformat() if x else None
+
+
+def parse_iso(s: str | None) -> dt.datetime | None:
+    if not s:
+        return None
+    try:
+        return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def local_display(x: dt.datetime | None) -> str:
+    if not x:
+        return "-"
+    return x.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+class FileLock:
+    def __enter__(self):
+        ROOT.mkdir(parents=True, exist_ok=True)
+        self.f = LOCK.open("a+")
+        fcntl.flock(self.f.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *_):
+        fcntl.flock(self.f.fileno(), fcntl.LOCK_UN)
+        self.f.close()
+
+
+def load(path: Path, default: dict[str, Any]) -> dict[str, Any]:
+    if not path.exists():
+        return json.loads(json.dumps(default))
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return json.loads(json.dumps(default))
+
+
+def save(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2, sort_keys=True, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def cfg() -> dict[str, Any]:
+    x = load(CFG, DEFAULT_CFG)
+    for k, v in DEFAULT_CFG.items():
+        x.setdefault(k, v)
+    return x
+
+
+def state() -> dict[str, Any]:
+    x = load(STATE, DEFAULT_STATE)
+    x.setdefault("preferred", None)
+    x.setdefault("accounts", {})
+    return x
+
+
+def ensure_layout() -> None:
+    ACCOUNTS.mkdir(parents=True, exist_ok=True)
+    SHARED.mkdir(parents=True, exist_ok=True)
+    PENDING.mkdir(parents=True, exist_ok=True)
+    USER_SYSTEMD.mkdir(parents=True, exist_ok=True)
+    for d in ["sessions", "archived_sessions", "skills", "rules", "sqlite"]:
+        (SHARED / d).mkdir(parents=True, exist_ok=True)
+    if not CFG.exists():
+        save(CFG, DEFAULT_CFG)
+    if not STATE.exists():
+        save(STATE, DEFAULT_STATE)
+
+
+def codex_real() -> str:
+    p = cfg().get("codex_real") or os.environ.get("CODEX_REAL")
+    if p and Path(p).exists():
+        return str(Path(p).resolve())
+
+    wrapper = (Path.home() / ".local/bin/codex").resolve()
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        c = Path(d) / "codex"
+        try:
+            if c.exists() and c.resolve() != wrapper:
+                return str(c.resolve())
+        except OSError:
+            pass
+    raise SystemExit(
+        "Não encontrei o binário real do Codex. "
+        "Defina codex_real em ~/.codex-manager/manager.json."
+    )
+
+
+def manager_bin() -> str:
+    p = cfg().get("manager_bin") or str(Path.home() / ".local/bin/codex-account")
+    return str(Path(p).expanduser())
+
+
+def valid_name(n: str) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", n):
+        raise SystemExit("Nome inválido. Use letras, números, ., _ ou -.")
+
+
+def home(n: str) -> Path:
+    return ACCOUNTS / n / "home"
+
+
+def links(n: str) -> None:
+    h = home(n)
+    h.mkdir(parents=True, exist_ok=True)
+    mapping = {
+        "config.toml": SHARED / "config.toml",
+        "sessions": SHARED / "sessions",
+        "archived_sessions": SHARED / "archived_sessions",
+        "skills": SHARED / "skills",
+        "rules": SHARED / "rules",
+    }
+    for name, target in mapping.items():
+        local = h / name
+        if local.exists() or local.is_symlink():
+            continue
+        if name.endswith(".toml") and not target.exists():
+            target.touch(mode=0o600)
+        local.symlink_to(target)
+
+
+def env_for(n: str) -> dict[str, str]:
+    e = os.environ.copy()
+    e["CODEX_HOME"] = str(home(n))
+    e["CODEX_SQLITE_HOME"] = str(SHARED / "sqlite")
+    for k in [
+        "CODEX_ACCESS_TOKEN",
+        "CODEX_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENAI_IDENTITY_TOKEN_FILE",
+        "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
+    ]:
+        e.pop(k, None)
+    return e
+
+
+def meta(st: dict[str, Any], n: str) -> dict[str, Any]:
+    return st["accounts"].setdefault(
+        n,
+        {
+            "enabled": True,
+            "priority": 100,
+            "status": "unknown",
+            "cooldown_until": None,
+            "last_success": None,
+            "last_failure": None,
+            "last_error": None,
+        },
+    )
+
+
+def available(st: dict[str, Any], exclude: set[str] | None = None) -> list[str]:
+    exclude = exclude or set()
+    t = utcnow()
+    out: list[str] = []
+    for n, m in st["accounts"].items():
+        if n in exclude or not m.get("enabled", True):
+            continue
+        cd = parse_iso(m.get("cooldown_until"))
+        if cd and cd > t:
+            continue
+        # needs-login has no automatic recovery point; do not retry it blindly.
+        if m.get("status") == "needs-login":
+            continue
+        out.append(n)
+
+    pref = st.get("preferred")
+
+    def key(n: str):
+        m = st["accounts"][n]
+        last = parse_iso(m.get("last_success")) or dt.datetime.min.replace(
+            tzinfo=dt.timezone.utc
+        )
+        return (
+            1 if n == pref else 0,
+            int(m.get("priority", 100)),
+            last.timestamp(),
+        )
+
+    return sorted(out, key=key, reverse=True)
+
+
+def next_reset(st: dict[str, Any]) -> tuple[str, dt.datetime] | None:
+    t = utcnow()
+    candidates: list[tuple[dt.datetime, str]] = []
+    for n, m in st["accounts"].items():
+        if not m.get("enabled", True):
+            continue
+        cd = parse_iso(m.get("cooldown_until"))
+        if cd and cd > t:
+            candidates.append((cd, n))
+    if not candidates:
+        return None
+    when, name = min(candidates)
+    return name, when
+
+
+def classify(text: str) -> str:
+    if any(re.search(p, text, re.I) for p in QUOTA):
+        return "quota"
+    if any(re.search(p, text, re.I) for p in AUTH):
+        return "auth"
+    return "other"
+
+
+def infer_reset(text: str) -> dt.datetime:
+    # ISO-ish timestamp if the CLI exposes one.
+    patterns = [
+        r"(20\d{2}-\d{2}-\d{2}T[0-9:.+-]+Z?)",
+        r"(20\d{2}-\d{2}-\d{2} [0-9]{2}:[0-9]{2}(?::[0-9]{2})?(?: ?[+-][0-9:]+)?)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if not m:
+            continue
+        raw = m.group(1)
+        try:
+            x = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if x.tzinfo is None:
+                x = x.replace(tzinfo=dt.datetime.now().astimezone().tzinfo)
+            if x > dt.datetime.now(x.tzinfo):
+                return x.astimezone(dt.timezone.utc)
+        except Exception:
+            pass
+
+    # Common human durations, e.g. "try again in 42 minutes" / "in 2 hours".
+    m = re.search(
+        r"(?:try again|reset(?:s)?|available again).*?"
+        r"(?:in\s+)?(\d+)\s*(minute|minutes|min|hour|hours|hr|hrs)",
+        text,
+        re.I,
+    )
+    if m:
+        value = int(m.group(1))
+        unit = m.group(2).lower()
+        delta = (
+            dt.timedelta(hours=value)
+            if unit.startswith(("hour", "hr"))
+            else dt.timedelta(minutes=value)
+        )
+        return utcnow() + delta
+
+    return utcnow() + dt.timedelta(minutes=int(cfg()["default_cooldown_minutes"]))
+
+
+def mark_ok(n: str) -> None:
+    with FileLock():
+        st = state()
+        m = meta(st, n)
+        m.update(
+            status="healthy",
+            cooldown_until=None,
+            last_success=iso(utcnow()),
+            last_error=None,
+        )
+        st["preferred"] = n
+        save(STATE, st)
+
+
+def mark_fail(n: str, kind: str, text: str) -> None:
+    with FileLock():
+        st = state()
+        m = meta(st, n)
+        m["last_failure"] = iso(utcnow())
+        m["last_error"] = text[-4000:]
+        if kind == "quota":
+            m["status"] = "limited"
+            m["cooldown_until"] = iso(infer_reset(text))
+        elif kind == "auth":
+            m["status"] = "needs-login"
+            m["cooldown_until"] = None
+        else:
+            m["status"] = "error"
+            m["cooldown_until"] = None
+        save(STATE, st)
+
+
+def newest_session(since: float | None = None) -> str | None:
+    cand: list[tuple[float, str]] = []
+    root = SHARED / "sessions"
+    if not root.exists():
+        return None
+    for p in root.rglob("*.jsonl"):
+        try:
+            mt = p.stat().st_mtime
+        except OSError:
+            continue
+        if since is not None and mt < since - 2:
+            continue
+        m = UUID_RE.search(p.name)
+        if m:
+            cand.append((mt, m.group("id")))
+    return max(cand)[1] if cand else None
+
+
+def stream(cmd: list[str], e: dict[str, str]) -> tuple[int, str]:
+    p = subprocess.Popen(
+        cmd,
+        env=e,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    tail: list[str] = []
+    assert p.stdout
+    for line in p.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        tail.append(line)
+        if len(tail) > 500:
+            tail.pop(0)
+    return p.wait(), "".join(tail)
+
+
+def pending_path(session: str) -> Path:
+    return PENDING / f"{session}.json"
+
+
+def unit_base(session: str) -> str:
+    compact = session.replace("-", "")
+    return f"codex-resume-{compact}"
+
+
+def systemctl_user(*args: str, check: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["systemctl", "--user", *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=check,
+    )
+
+
+def systemd_quote(s: str) -> str:
+    # systemd unit syntax accepts C-style escaped strings inside double quotes.
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def remove_units(session: str) -> None:
+    base = unit_base(session)
+    timer = f"{base}.timer"
+    service = f"{base}.service"
+    systemctl_user("disable", "--now", timer)
+    for p in [USER_SYSTEMD / timer, USER_SYSTEMD / service]:
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+    systemctl_user("daemon-reload")
+    systemctl_user("reset-failed", service)
+    systemctl_user("reset-failed", timer)
+
+
+def schedule_resume(
+    session: str,
+    project: str,
+    when: dt.datetime,
+    reason: str = "all-accounts-limited",
+) -> None:
+    ensure_layout()
+    grace = int(cfg().get("schedule_grace_seconds", 20))
+    when = when + dt.timedelta(seconds=grace)
+    base = unit_base(session)
+    timer_name = f"{base}.timer"
+    service_name = f"{base}.service"
+    timer_path = USER_SYSTEMD / timer_name
+    service_path = USER_SYSTEMD / service_name
+
+    # Idempotent: replace any prior timer for the same logical Codex session.
+    systemctl_user("disable", "--now", timer_name)
+
+    manager = manager_bin()
+    project_path = str(Path(project).expanduser().resolve())
+    service = f"""[Unit]
+Description=Resume Codex session {session}
+
+[Service]
+Type=oneshot
+WorkingDirectory={systemd_quote(project_path)}
+ExecStart={systemd_quote(manager)} resume-session {systemd_quote(session)}
+"""
+    # Use UTC explicitly so DST/local timezone ambiguity cannot move the job.
+    calendar = when.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    timer = f"""[Unit]
+Description=Schedule Codex session {session}
+
+[Timer]
+OnCalendar={calendar}
+Persistent=true
+AccuracySec=5s
+Unit={service_name}
+
+[Install]
+WantedBy=timers.target
+"""
+
+    service_path.write_text(service)
+    timer_path.write_text(timer)
+    systemctl_user("daemon-reload", check=True)
+    p = systemctl_user("enable", "--now", timer_name)
+    if p.returncode != 0:
+        raise SystemExit(
+            "Falha ao criar timer systemd --user:\n"
+            + (p.stderr or p.stdout)
+        )
+
+    record = {
+        "session_id": session,
+        "project": project_path,
+        "scheduled_for": iso(when),
+        "created_at": iso(utcnow()),
+        "reason": reason,
+        "unit": base,
+        "status": "scheduled",
+    }
+    save(pending_path(session), record)
+
+    print(
+        f"[codex-account] todas as contas estão indisponíveis.\n"
+        f"[codex-account] retomada agendada para {local_display(when)}\n"
+        f"[codex-account] sessão: {session}\n"
+        f"[codex-account] projeto: {project_path}",
+        file=sys.stderr,
+    )
+
+
+def finish_pending(session: str, status: str, extra: dict[str, Any] | None = None) -> None:
+    p = pending_path(session)
+    rec = load(p, {}) if p.exists() else {}
+    rec["status"] = status
+    rec["updated_at"] = iso(utcnow())
+    if extra:
+        rec.update(extra)
+    if rec:
+        save(p, rec)
+
+
+def maybe_schedule(session: str | None, project: str, reason: str) -> bool:
+    if not session or not cfg().get("auto_schedule", True):
+        return False
+    nr = next_reset(state())
+    if not nr:
+        return False
+    _, when = nr
+    schedule_resume(session, project, when, reason)
+    return True
+
+
+def bootstrap(a) -> None:
+    ensure_layout()
+    valid_name(a.name)
+    src = Path(a.source).expanduser()
+    if not src.exists():
+        raise SystemExit(f"Origem inexistente: {src}")
+    links(a.name)
+    dst = home(a.name)
+    if (src / "auth.json").exists() and not (dst / "auth.json").exists():
+        shutil.copy2(src / "auth.json", dst / "auth.json")
+        os.chmod(dst / "auth.json", 0o600)
+    if (
+        (src / "config.toml").exists()
+        and (SHARED / "config.toml").stat().st_size == 0
+    ):
+        shutil.copy2(src / "config.toml", SHARED / "config.toml")
+    for d in ["sessions", "archived_sessions", "skills", "rules"]:
+        if (src / d).is_dir():
+            shutil.copytree(src / d, SHARED / d, dirs_exist_ok=True)
+    with FileLock():
+        st = state()
+        meta(st, a.name)
+        st["preferred"] = a.name
+        save(STATE, st)
+    print(f"Conta '{a.name}' importada sem alterar {src}.")
+
+
+def add(a) -> None:
+    ensure_layout()
+    valid_name(a.name)
+    with FileLock():
+        st = state()
+        if a.name in st["accounts"]:
+            raise SystemExit("Conta já existe.")
+        m = meta(st, a.name)
+        m["priority"] = a.priority
+        save(STATE, st)
+    links(a.name)
+    if not a.no_login:
+        subprocess.call([codex_real(), "login"], env=env_for(a.name))
+    print(f"Conta '{a.name}' criada.")
+
+
+def login(a) -> None:
+    ensure_layout()
+    st = state()
+    if a.name not in st["accounts"]:
+        raise SystemExit("Conta inexistente.")
+    links(a.name)
+    rc = subprocess.call([codex_real(), "login"], env=env_for(a.name))
+    if rc == 0:
+        with FileLock():
+            st = state()
+            m = meta(st, a.name)
+            m["status"] = "unknown"
+            m["cooldown_until"] = None
+            save(STATE, st)
+    raise SystemExit(rc)
+
+
+def list_cmd(_) -> None:
+    ensure_layout()
+    st = state()
+    print(
+        f"{'NAME':20} {'STATUS':12} {'PRIO':>5} "
+        f"{'RESET/COOLDOWN':24} {'LAST SUCCESS'}"
+    )
+    for n, m in sorted(st["accounts"].items()):
+        p = "*" if st.get("preferred") == n else " "
+        reset = local_display(parse_iso(m.get("cooldown_until")))
+        print(
+            f"{p}{n:19} {m.get('status','unknown'):12} "
+            f"{m.get('priority',100):5} {reset:24} "
+            f"{m.get('last_success') or '-'}"
+        )
+    nr = next_reset(st)
+    if not available(st) and nr:
+        print(f"\nPróxima conta elegível: {nr[0]} em {local_display(nr[1])}")
+
+
+def use(a) -> None:
+    with FileLock():
+        st = state()
+        if a.name not in st["accounts"]:
+            raise SystemExit("Conta inexistente.")
+        st["preferred"] = a.name
+        save(STATE, st)
+    print(a.name)
+
+
+def next_cmd(_) -> None:
+    with FileLock():
+        st = state()
+        usable = available(st)
+        if not usable:
+            raise SystemExit("Nenhuma conta disponível.")
+        cur = st.get("preferred")
+        ordered = [n for n in st["accounts"] if n in usable]
+        try:
+            nxt = ordered[(ordered.index(cur) + 1) % len(ordered)]
+        except ValueError:
+            nxt = ordered[0]
+        st["preferred"] = nxt
+        save(STATE, st)
+    print(nxt)
+
+
+def limited(a) -> None:
+    with FileLock():
+        st = state()
+        if a.name not in st["accounts"]:
+            raise SystemExit("Conta inexistente.")
+        m = meta(st, a.name)
+        mins = a.minutes or int(cfg()["default_cooldown_minutes"])
+        m["status"] = "limited"
+        m["cooldown_until"] = iso(utcnow() + dt.timedelta(minutes=mins))
+        m["last_failure"] = iso(utcnow())
+        m["last_error"] = a.reason or "Marcada manualmente"
+        save(STATE, st)
+    print(f"{a.name}: cooldown {mins} min")
+
+
+def run(a) -> None:
+    ensure_layout()
+    st = state()
+    choices = available(st)
+    if not choices:
+        nr = next_reset(st)
+        if nr:
+            raise SystemExit(
+                f"Nenhuma conta disponível. Próxima: {nr[0]} em {local_display(nr[1])}."
+            )
+        raise SystemExit("Nenhuma conta disponível.")
+    n = choices[0]
+    links(n)
+    cmd = [codex_real()]
+    if cfg().get("no_daemon", True) and "--no-daemon" not in a.codex_args:
+        cmd.append("--no-daemon")
+    cmd += a.codex_args
+    print(f"[codex-account] conta: {n}", file=sys.stderr)
+    rc = subprocess.call(cmd, env=env_for(n))
+    if rc == 0:
+        mark_ok(n)
+    raise SystemExit(rc)
+
+
+def exec_cmd(a) -> None:
+    ensure_layout()
+    attempted: set[str] = set()
+    session: str | None = None
+    first = True
+    c = cfg()
+    project = os.getcwd()
+
+    while True:
+        choices = available(state(), attempted)
+        if not choices:
+            if maybe_schedule(session, project, "all-accounts-limited"):
+                raise SystemExit(75)
+            nr = next_reset(state())
+            if nr:
+                raise SystemExit(
+                    f"Todas as contas estão em cooldown. Próxima: "
+                    f"{nr[0]} em {local_display(nr[1])}."
+                )
+            raise SystemExit(
+                "Todas as contas falharam e nenhuma possui horário de recuperação automático."
+            )
+
+        n = choices[0]
+        attempted.add(n)
+        links(n)
+        started = time.time()
+
+        if first:
+            cmd = [codex_real(), "exec"] + a.codex_args
+        else:
+            if not session:
+                raise SystemExit("SESSION_ID ausente para resume.")
+            cmd = [
+                codex_real(),
+                "exec",
+                "resume",
+                session,
+                c["continuation_prompt"],
+            ]
+
+        print(f"[codex-account] exec usando: {n}", file=sys.stderr)
+        rc, out = stream(cmd, env_for(n))
+
+        if rc == 0:
+            mark_ok(n)
+            if session and pending_path(session).exists():
+                finish_pending(session, "completed", {"completed_at": iso(utcnow())})
+                remove_units(session)
+            return
+
+        kind = classify(out)
+        mark_fail(n, kind, out)
+
+        if kind != "quota":
+            raise SystemExit(rc)
+
+        if first:
+            session = newest_session(started)
+            first = False
+
+        if not session:
+            raise SystemExit(
+                "Limite detectado, mas não consegui identificar SESSION_ID para resume."
+            )
+
+        print(
+            f"[codex-account] limite em {n}; retomando {session} em outra conta...",
+            file=sys.stderr,
+        )
+
+
+def resume_session(a) -> None:
+    ensure_layout()
+    session = a.session_id
+    p = pending_path(session)
+    rec = load(p, {})
+    project = rec.get("project") or os.getcwd()
+    attempted: set[str] = set()
+    c = cfg()
+
+    # Disable the firing timer immediately. If another schedule is needed,
+    # schedule_resume will recreate it.
+    base = unit_base(session)
+    systemctl_user("disable", "--now", f"{base}.timer")
+
+    try:
+        os.chdir(project)
+    except OSError as e:
+        finish_pending(session, "failed", {"error": f"project unavailable: {e}"})
+        raise SystemExit(f"Diretório do projeto indisponível: {project}: {e}")
+
+    while True:
+        choices = available(state(), attempted)
+        if not choices:
+            nr = next_reset(state())
+            if nr:
+                schedule_resume(session, project, nr[1], "still-limited-after-scheduled-resume")
+                finish_pending(
+                    session,
+                    "scheduled",
+                    {"scheduled_for": iso(nr[1]), "last_attempt": iso(utcnow())},
+                )
+                return
+            finish_pending(
+                session,
+                "blocked",
+                {
+                    "last_attempt": iso(utcnow()),
+                    "error": "Nenhuma conta com recuperação automática disponível.",
+                },
+            )
+            remove_units(session)
+            raise SystemExit(
+                "Retomada bloqueada: nenhuma conta disponível e nenhum cooldown futuro."
+            )
+
+        n = choices[0]
+        attempted.add(n)
+        links(n)
+        print(
+            f"[codex-account] retomada agendada usando conta: {n}",
+            file=sys.stderr,
+        )
+        cmd = [
+            codex_real(),
+            "exec",
+            "resume",
+            session,
+            c["continuation_prompt"],
+        ]
+        rc, out = stream(cmd, env_for(n))
+
+        if rc == 0:
+            mark_ok(n)
+            finish_pending(
+                session,
+                "completed",
+                {
+                    "completed_at": iso(utcnow()),
+                    "account": n,
+                },
+            )
+            remove_units(session)
+            return
+
+        kind = classify(out)
+        mark_fail(n, kind, out)
+
+        if kind != "quota":
+            finish_pending(
+                session,
+                "failed",
+                {
+                    "last_attempt": iso(utcnow()),
+                    "account": n,
+                    "error": out[-4000:],
+                },
+            )
+            remove_units(session)
+            raise SystemExit(rc)
+
+        # quota: try another account immediately; if none remain, loop will
+        # schedule the next known reset.
+
+
+def pending_cmd(_) -> None:
+    ensure_layout()
+    files = sorted(PENDING.glob("*.json"))
+    if not files:
+        print("Nenhuma retomada registrada.")
+        return
+
+    print(f"{'SESSION':36} {'STATUS':12} {'SCHEDULED':24} PROJECT")
+    for p in files:
+        rec = load(p, {})
+        scheduled = local_display(parse_iso(rec.get("scheduled_for")))
+        print(
+            f"{rec.get('session_id', p.stem):36} "
+            f"{rec.get('status','unknown'):12} "
+            f"{scheduled:24} "
+            f"{rec.get('project','-')}"
+        )
+
+
+def cancel_cmd(a) -> None:
+    ensure_layout()
+    session = a.session_id
+    remove_units(session)
+    p = pending_path(session)
+    if p.exists():
+        rec = load(p, {})
+        rec["status"] = "cancelled"
+        rec["cancelled_at"] = iso(utcnow())
+        save(p, rec)
+    print(f"Retomada cancelada: {session}")
+
+
+def doctor(_) -> None:
+    ensure_layout()
+    st = state()
+    problems = 0
+    print("manager:", ROOT)
+    try:
+        real = codex_real()
+        print("codex real:", real)
+    except SystemExit as e:
+        print("ERRO:", e)
+        real = None
+        problems += 1
+
+    print("shared sqlite:", SHARED / "sqlite")
+    print("systemd user dir:", USER_SYSTEMD)
+    p = systemctl_user("is-system-running")
+    if p.returncode not in (0, 1):
+        print("AVISO: systemd --user não respondeu normalmente:", p.stderr.strip())
+        problems += 1
+    else:
+        print("systemd --user: ok")
+
+    print("contas:", len(st["accounts"]))
+    for n in st["accounts"]:
+        au = home(n) / "auth.json"
+        co = home(n) / "config.toml"
+        print(
+            f"- {n}: auth={'ok' if au.exists() else 'MISSING'}, "
+            f"config={'ok' if co.exists() else 'MISSING'}"
+        )
+        if not au.exists():
+            problems += 1
+        if real and au.exists():
+            q = subprocess.run(
+                [real, "login", "status"],
+                env=env_for(n),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            print("  login:", q.stdout.strip().replace("\n", " | "))
+            problems += q.returncode != 0
+
+    nr = next_reset(st)
+    if nr:
+        print("próximo reset:", nr[0], local_display(nr[1]))
+
+    if problems:
+        raise SystemExit(1)
+    print("OK")
+
+
+def parser():
+    p = argparse.ArgumentParser(prog="codex-account")
+    s = p.add_subparsers(dest="cmd", required=True)
+
+    x = s.add_parser("bootstrap")
+    x.add_argument("name")
+    x.add_argument("--source", default=str(Path.home() / ".codex"))
+    x.set_defaults(func=bootstrap)
+
+    x = s.add_parser("add")
+    x.add_argument("name")
+    x.add_argument("--priority", type=int, default=100)
+    x.add_argument("--no-login", action="store_true")
+    x.set_defaults(func=add)
+
+    x = s.add_parser("login")
+    x.add_argument("name")
+    x.set_defaults(func=login)
+
+    x = s.add_parser("list")
+    x.set_defaults(func=list_cmd)
+
+    x = s.add_parser("use")
+    x.add_argument("name")
+    x.set_defaults(func=use)
+
+    x = s.add_parser("next")
+    x.set_defaults(func=next_cmd)
+
+    x = s.add_parser("limited")
+    x.add_argument("name")
+    x.add_argument("--minutes", type=int)
+    x.add_argument("--reason")
+    x.set_defaults(func=limited)
+
+    x = s.add_parser("run")
+    x.add_argument("codex_args", nargs=argparse.REMAINDER)
+    x.set_defaults(func=run)
+
+    x = s.add_parser("exec")
+    x.add_argument("codex_args", nargs=argparse.REMAINDER)
+    x.set_defaults(func=exec_cmd)
+
+    x = s.add_parser("resume-session")
+    x.add_argument("session_id")
+    x.set_defaults(func=resume_session)
+
+    x = s.add_parser("pending")
+    x.set_defaults(func=pending_cmd)
+
+    x = s.add_parser("cancel")
+    x.add_argument("session_id")
+    x.set_defaults(func=cancel_cmd)
+
+    x = s.add_parser("doctor")
+    x.set_defaults(func=doctor)
+
+    return p
+
+
+if __name__ == "__main__":
+    a = parser().parse_args()
+    a.func(a)

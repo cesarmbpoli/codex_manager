@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MANAGER="${CODEX_ACCOUNT_MANAGER_BIN:-$HOME/.local/bin/codex-account}"
+
+if [[ "${1:-}" == "exec" ]]; then
+  shift
+  exec "$MANAGER" exec "$@"
+else
+  exec "$MANAGER" run "$@"
+fi
