@@ -1192,6 +1192,39 @@ Nesse caso, cancele o job e reinicie a execução no novo diretório.
 
 ---
 
+### 43.8 Flags do Codex aparecem como "unrecognized arguments"
+
+Se uma versão antiga do wrapper estiver instalada, flags globais ou de subcomandos do
+Codex podem ser interpretadas pelo `argparse` do `codex-account`.
+
+Exemplos afetados antes da correção:
+
+```bash
+codex --ignore-user-config --skip-git-repo-check
+codex exec --sandbox workspace-write "..."
+```
+
+O wrapper atual usa um separador interno `--` ao chamar o manager e remove esse separador
+antes de executar o Codex real. Assim, flags pertencentes ao Codex não são parseadas pelo
+manager.
+
+Se esse erro aparecer:
+
+```bash
+cd ~/code/codex_manager
+git pull origin main
+./install.sh
+source ~/.bashrc
+```
+
+Depois valide com:
+
+```bash
+codex --version
+codex --help
+codex-account doctor
+```
+
 ## 44. Testes
 
 Rodar localmente:

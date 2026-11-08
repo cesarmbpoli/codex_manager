@@ -903,6 +903,21 @@ def limited(a) -> None:
     print(f"{a.name}: cooldown {mins} min")
 
 
+def passthrough_args(args: list[str]) -> list[str]:
+    """Remove only the argparse separator inserted by codex-wrapper.
+
+    The wrapper invokes internal passthrough subcommands as:
+        codex-account run -- <original Codex argv>
+        codex-account exec -- <original Codex exec argv>
+
+    argparse otherwise interprets unknown Codex flags as manager flags before
+    REMAINDER can receive them.
+    """
+    if args and args[0] == "--":
+        return args[1:]
+    return args
+
+
 def run(a) -> None:
     ensure_layout()
     st = state()
@@ -916,10 +931,11 @@ def run(a) -> None:
         raise SystemExit("Nenhuma conta disponível.")
     n = choices[0]
     links(n)
+    codex_args = passthrough_args(a.codex_args)
     cmd = [codex_real()]
-    if cfg().get("no_daemon", True) and "--no-daemon" not in a.codex_args:
+    if cfg().get("no_daemon", True) and "--no-daemon" not in codex_args:
         cmd.append("--no-daemon")
-    cmd += a.codex_args
+    cmd += codex_args
     print(f"[codex-account] conta: {n}", file=sys.stderr)
     rc = subprocess.call(cmd, env=env_for(n))
     if rc == 0:
@@ -929,6 +945,7 @@ def run(a) -> None:
 
 def exec_cmd(a) -> None:
     ensure_layout()
+    a.codex_args = passthrough_args(a.codex_args)
     refresh_usage_pool()
     attempted: set[str] = set()
     session: str | None = None

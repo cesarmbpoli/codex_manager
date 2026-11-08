@@ -23,6 +23,18 @@ runtime = load_script("codex_manager_runtime", "codex-runtime")
 
 
 class ManagerUnitTests(unittest.TestCase):
+    def test_passthrough_args_removes_internal_separator(self):
+        self.assertEqual(
+            manager.passthrough_args(["--", "--ignore-user-config", "--sandbox", "workspace-write"]),
+            ["--ignore-user-config", "--sandbox", "workspace-write"],
+        )
+
+    def test_passthrough_args_preserves_user_separator(self):
+        self.assertEqual(
+            manager.passthrough_args(["--", "--", "--literal-prompt"]),
+            ["--", "--literal-prompt"],
+        )
+
     def test_systemd_quote_escapes_percent_specifiers(self):
         quoted = manager.systemd_quote("/tmp/a%b")
         self.assertIn("a%%b", quoted)

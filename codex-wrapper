@@ -10,9 +10,9 @@ case "${1:-}" in
     ;;
   exec)
     shift
-    exec "$MANAGER" exec "$@"
+    exec "$MANAGER" exec -- "$@"
     ;;
   *)
-    exec "$MANAGER" run "$@"
+    exec "$MANAGER" run -- "$@"
     ;;
 esac
